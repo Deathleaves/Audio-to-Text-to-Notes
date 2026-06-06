@@ -1,22 +1,176 @@
-# 音频文件（用户输入的原始音频 + 预处理中间文件）
+# ============================================
+# 隐私与安全 — 包含对话内容的文件不上传
+# ============================================
+
+# 音频文件（原始录音 + 预处理 WAV 片段）
+# ⚠ 包含对话内容，属于隐私数据
 audio/
 
-# whisper.cpp 原始输出（可由 Skill 重新生成）
-output/*.srt
-output/*.txt
+# 输出文件（完整讲话记录 + 会议纪要）
+# ⚠ 包含对话内容和提炼信息，属于隐私数据
+output/
 
-# Windows 系统文件
-Thumbs.db
-desktop.ini
-ehthumbs.db
-*.lnk
+# 环境变量和密钥
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
 
-# Claude Code 本地设置（含个人 token）
+# Claude Code 本地设置（可能包含 PAT token / API keys）
 .claude/settings.local.json
 
-# 编辑器/IDE
-.vscode/
+# ============================================
+# whisper.cpp — 模型文件大且可从源重新下载
+# ============================================
+
+whisper.cpp/
+models/
+ggml-*.bin
+
+# ============================================
+# 操作系统文件
+# ============================================
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ============================================
+# 编辑器 / IDE
+# ============================================
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+*.code-workspace
+
+# JetBrains (IntelliJ, PyCharm, GoLand, etc.)
 .idea/
+*.iml
+*.iws
+*.ipr
+out/
+.idea_modules/
+
+# Vim / Neovim
 *.swp
 *.swo
+*.swn
+*.bak
+*.un~
+Session.vim
+.netrwhist
+tags
+
+# Emacs
 *~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ============================================
+# 日志 / 调试输出
+# ============================================
+
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================
+# Node.js
+# ============================================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+lerna-debug.log*
+.pnpm/
+*.tsbuildinfo
+
+# ============================================
+# Python
+# ============================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================
+# Git 自身
+# ============================================
+
+.git/objects/pack/
+.git/refs/original/
+*.patch
+*.diff
+
+# ============================================
+# 杂项
+# ============================================
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+
+# 压缩包（可能是用户下载的模型/工具）
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# 二进制文件
+*.exe
+*.dll
+*.so
+*.dylib

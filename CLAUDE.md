@@ -50,3 +50,42 @@ Meeting/
 
 如果是同一场会议的多段录音，按时间顺序命名（如 `会议_001.mp3`、`会议_002.mp3`），
 Skill 会自动识别并按顺序合并处理。
+
+## 版本管理
+
+本项目的 Skill 定义（`.claude/skills/meeting-transcribe.md`）和项目配置（`CLAUDE.md`、`README.md`、`.gitignore` 等）
+使用 Git 管理并同步至 GitHub 仓库 [Deathleaves/Audio-to-Text-to-Notes](https://github.com/Deathleaves/Audio-to-Text-to-Notes)。
+
+### 自动同步规则
+
+当你在使用过程中对项目进行以下操作时，Claude 会自动 commit 并 push 到 GitHub：
+
+1. **优化 Skill**（`.claude/skills/meeting-transcribe.md`）
+   - 改进说话人区分逻辑
+   - 优化会议纪要模板
+   - 修复流程中的错误
+   - 完善错误处理
+   - 新增功能步骤
+
+2. **更新项目配置**
+   - 修改 `CLAUDE.md`
+   - 修改 `README.md`
+   - 修改 `.gitignore`
+   - 修改 `目标.md`
+
+3. **添加辅助脚本**（`scripts/` 目录下）
+   - 新增自动化工具
+   - 改进工作流程
+
+### 不上传的内容
+
+- `audio/` 目录下的音频文件（隐私数据）
+- `output/` 目录下的转录结果和纪要（隐私数据）
+- `.claude/settings.local.json`（可能含 token）
+- `.env` 文件（密钥信息）
+
+### 注意事项
+
+- 每次 commit 前会检查是否有实质性变更（避免空提交）
+- commit 信息会清晰说明变更内容
+- 如需手动同步，使用标准 git 命令即可
