@@ -20,6 +20,9 @@ output/
 # Claude Code 本地设置（可能包含 PAT token / API keys）
 .claude/settings.local.json
 
+# 项目原始需求文档
+目标.md
+
 # ============================================
 # whisper.cpp — 模型文件大且可从源重新下载
 # ============================================
