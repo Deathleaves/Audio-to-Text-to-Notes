@@ -30,12 +30,15 @@
 
 ```
 Meeting/
+├── README.md                               # 语言选择入口页
+├── README.zh-CN.md                         # 中文版文档
+├── README.en.md                            # English documentation
 ├── CLAUDE.md                               # 本文件
-├── 目标.md                                 # 项目需求
 ├── audio/                                  # 音频文件（用户放置）和预处理中间文件
 ├── output/                                 # 输出目录
 │   ├── 【完整讲话记录】*.md                 # 完整转录 + 说话人标注
 │   └── 【会议纪要】*.md                     # 结构化会议纪要
+├── scripts/                                # 辅助脚本（可选）
 └── .claude/
     └── skills/
         └── meeting-transcribe.md           # Skill 定义
