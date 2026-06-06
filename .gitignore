@@ -1,0 +1,22 @@
+# 音频文件（用户输入的原始音频 + 预处理中间文件）
+audio/
+
+# whisper.cpp 原始输出（可由 Skill 重新生成）
+output/*.srt
+output/*.txt
+
+# Windows 系统文件
+Thumbs.db
+desktop.ini
+ehthumbs.db
+*.lnk
+
+# Claude Code 本地设置（含个人 token）
+.claude/settings.local.json
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

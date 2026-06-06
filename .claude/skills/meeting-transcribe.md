@@ -1,0 +1,348 @@
+---
+name: meeting-transcribe
+description: 将会议录音自动转为带说话人区分的文本，并生成会议纪要。触发方式：用户在 Meeting 项目中发送音频文件即可。
+---
+
+# 会议录音转文字 + 纪要生成
+
+## 概述
+
+当用户发送音频文件时，自动执行以下流程：
+1. FFmpeg 音频预处理（自动检测格式、时长，按需分段）
+2. whisper.cpp **GPU 加速**语音转文字（本地部署，RTX 5090D，中文 large-v3 模型）
+3. Claude 分析文本，区分说话人
+4. 输出「完整讲话记录」Markdown 文件
+5. Claude 生成「会议纪要」Markdown 文件
+
+---
+
+## 环境初始化（每次执行前自动运行）
+
+在执行任何步骤前，先配置 PATH 环境变量：
+
+```bash
+# 自动查找 winget 安装的工具路径
+FFMPEG_DIR=$(find "/c/Users/admin/AppData/Local/Microsoft/WinGet/Packages" -maxdepth 2 -name "ffmpeg.exe" -path "*/bin/*" 2>/dev/null | head -1 | xargs dirname)
+CUDA_BIN_DIR=$(find "/c/Program Files/NVIDIA GPU Computing Toolkit" -maxdepth 4 -name "cudart64_*.dll" -path "*/bin/*" 2>/dev/null | head -1 | xargs dirname)
+export PATH="$FFMPEG_DIR:$CUDA_BIN_DIR:$PATH"
+```
+
+> **说明**：FFmpeg 通过 winget 安装。CUDA runtime DLL 路径确保 whisper.cpp 能找到 GPU 加速库。
+
+**GPU 可用性验证**（每次转录前确认）：
+```bash
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null
+```
+
+## 前置依赖检查（首次执行时引导用户）
+
+在执行流程前，先检查必要工具是否就绪。
+
+### 检查 FFmpeg
+
+```bash
+ffmpeg -version 2>/dev/null && echo "OK" || echo "NOT FOUND"
+```
+
+如果未安装，告知用户：
+> **Windows**: `winget install Gyan.FFmpeg`  
+> **Mac**: `brew install ffmpeg`
+
+### 检查 whisper.cpp（需 CUDA/GPU 版本）
+
+```bash
+~/whisper.cpp/build/bin/whisper-cli --version 2>/dev/null | head -1
+```
+
+验证 GPU 支持（在转录输出中应显示 `CUDA0` 设备和 VRAM 信息）：
+```bash
+~/whisper.cpp/build/bin/whisper-cli -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin -l zh -f /dev/null 2>&1 | grep -i cuda || echo "⚠ GPU 可能未启用"
+```
+
+如果未找到，告知用户：
+
+> 请先部署 whisper.cpp（只需一次）：
+> **Windows**：
+> 1. 安装前置工具：`winget install Kitware.CMake Gyan.FFmpeg BrechtSanders.WinLibs.POSIX.UCRT`
+> 2. 安装 **CUDA Toolkit**：`winget install Nvidia.CUDA`
+> 3. 安装 **Visual Studio Build Tools**（含 C++ 工作负载）
+> 4. 编译 CUDA 版 whisper.cpp：
+> ```bash
+> git clone https://github.com/ggerganov/whisper.cpp.git ~/whisper.cpp
+> cd ~/whisper.cpp
+> cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+> cmake --build build --config Release --parallel
+> ```
+> 5. 下载模型：
+> ```bash
+> bash ./models/download-ggml-model.sh large-v3-q5_0
+> ```
+
+### 检查 whisper.cpp 模型文件
+
+```bash
+test -f ~/whisper.cpp/models/ggml-large-v3-q5_0.bin && echo "OK" || echo "NOT FOUND"
+```
+
+如果未找到，告知用户：
+
+> whisper.cpp 模型文件未下载，请运行：
+> ```bash
+> cd ~/whisper.cpp && bash ./models/download-ggml-model.sh large-v3-q5_0
+> ```
+> 如果 HuggingFace 无法访问，可用镜像：
+> ```bash
+> curl -L -o ~/whisper.cpp/models/ggml-large-v3-q5_0.bin \
+>   "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin"
+> ```
+
+如果所有依赖就绪，直接进入流程。
+
+---
+
+## 执行流程
+
+### Step 0: 确认输入
+
+1. 确认用户提供的音频文件路径
+2. 如果有多个音频文件，询问用户：
+   - 这些是否是同一场会议的分段录音？（是 → 按文件名排序合并处理）
+   - 还是多场不同的会议？（是 → 分别处理，每场输出独立的两个文件）
+3. 如果用户指出了会议名称/主题，记录用于命名输出文件；否则从文件名推断
+
+### Step 1: 音频文件信息检测
+
+对每个音频文件，使用 ffprobe 获取基本信息：
+
+```bash
+ffprobe -v quiet -show_entries format=duration,format_name,size -of json <音频文件路径>
+```
+
+向用户展示音频文件摘要：
+- 文件名、格式、时长
+- 如果有多个文件：总时长、文件数
+- 预计处理时间（**GPU RTX 5090D**：30 分钟音频约 30-60 秒，1 小时约 1-2 分钟）
+
+**⚠️ 重要：告知用户预计处理时间，让用户确认后再继续！**
+
+### Step 2: FFmpeg 预处理
+
+对每个音频文件，转为 whisper.cpp 标准输入格式：
+
+```bash
+# 检测时长
+DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "<输入文件>")
+AUDIO_SECONDS=${DURATION%.*}
+
+# 如果时长 > 1800 秒（30分钟），分段处理
+# 否则直接转换
+if [ "$AUDIO_SECONDS" -gt 1800 ]; then
+  # 分段：每 30 分钟一段，自动编号
+  ffmpeg -y -i "<输入文件>" -ar 16000 -ac 1 \
+    -f segment -segment_time 1800 \
+    -c:a pcm_s16le "<输出前缀>_%03d.wav"
+  echo ">>> 音频已分为多段（每段 ≤ 30 分钟）"
+else
+  # 直接转换：16kHz 单声道 WAV
+  ffmpeg -y -i "<输入文件>" -ar 16000 -ac 1 -c:a pcm_s16le "<输出文件>.wav"
+  echo ">>> 音频已转换为 16kHz 单声道 WAV"
+fi
+```
+
+**输出路径规范**：所有预处理后的 WAV 文件放在项目 `audio/` 目录下。
+
+### Step 3: whisper.cpp GPU 加速转录
+
+对每个预处理后的 WAV 文件，执行转录（**GPU 自动启用**，无需额外参数）：
+
+```bash
+~/whisper.cpp/build/bin/whisper-cli \
+  -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin \
+  -l zh \
+  -osrt \
+  -otxt \
+  -f "<WAV 文件路径>" \
+  -of "<输出路径前缀>"
+```
+
+> **GPU 加速**：RTX 5090D (32GB VRAM)，whisper-cli 编译时已启用 CUDA，运行时自动检测 GPU。
+> 模型完全加载到 GPU 显存（~1.1GB），encode 时间比 CPU 快 **~157x**。
+
+参数说明：
+- `-m`: 模型文件路径
+- `-l zh`: 指定中文语言（避免自动检测错误）
+- `-osrt`: 输出 SRT 格式（带毫秒级时间戳，用于后续说话人区分）
+- `-otxt`: 同时输出纯文本
+- `-f`: 输入音频文件
+- `-of`: 输出文件路径前缀（会生成 `.srt` 和 `.txt` 两个文件）
+
+**输出文件**：将转录结果保存在 `output/` 目录下，命名格式为 `<会议名>_transcript.srt` 和 `<会议名>_transcript.txt`。
+
+**多段处理**：如果 Step 2 产生了多个分段，按顺序对每个分段执行转录，然后将文本内容按时间顺序合并（注意分段可能有时间偏移，需要累加时间）。
+
+### Step 4: Claude 分析转录文本 + 说话人区分
+
+读取 whisper.cpp 输出的 SRT 文件（和 TXT 文件作为辅助），执行以下分析：
+
+#### 4.1 解析 SRT 时间戳
+- SRT 格式：序号 → `开始时间 --> 结束时间` → 文本 → 空行
+- 提取每段的起止时间和文本内容
+- 多段合并时，后续分段的时间需加上前面分段的总时长
+
+#### 4.2 推断说话人
+根据以下线索推断说话人切换点：
+- **对话轮转**：一问一答的结构
+- **观点对立**：出现 "但是"、"我不同意"、"我觉得" 等转折
+- **称呼语**：出现 "XX你觉得呢"、"XX来说一下" 等指名道姓的表达
+- **话题引导**：出现 "接下来"、"下面"、"我们讨论一下" 等主持会议的语言
+- **语义边界**：前后文主题明显变化
+
+#### 4.3 标注规则
+- 首次出现的说话人标注为 **Speaker A**，第二个为 **Speaker B**，以此类推
+- 如果上下文能推断角色（如"我是产品部的XX"），则在括号中标注角色，如 **Speaker A（产品经理）**
+- 如果某段话明显是会议主持人说的（如开场白、流程引导），标注为 **Speaker A（主持人）**
+- 合并相邻的同一说话人的连续段落
+- 短路消除：如果某段极短（< 3 秒）且夹在同一说话人的两段之间，可能是转录碎片，合并处理
+
+#### 4.4 输出「完整讲话记录」Markdown
+
+写入 `output/【完整讲话记录】<会议名>.md`：
+
+```markdown
+# 完整讲话记录：<会议名称>
+
+**日期**：YYYY-MM-DD
+**时长**：HH:MM:SS
+**音频文件**：xxx.mp3, xxx.mp3
+**转录引擎**：whisper.cpp large-v3-q5_0
+**说话人区分**：Claude 自动分析
+
+---
+
+[00:00:05] **Speaker A（主持人）**：今天我们来讨论一下下一版本的功能规划...
+
+[00:00:30] **Speaker B**：我觉得优先级的排序应该以用户反馈为准...
+
+[00:02:15] **Speaker A（主持人）**：同意这个方向，那下面请 Speaker C 介绍一下调研结果。
+
+[00:02:30] **Speaker C**：好的，上周我们调研了 100 位用户...
+
+...（全量内容，不省略）
+
+---
+
+> 共识别 N 位说话人 | 总段落数：M | 转录文字数：K
+```
+
+**注意**：
+- 保留所有转录内容，不省略、不总结
+- 时间戳使用 `[HH:MM:SS]` 格式
+- 如果 whisper.cpp 转录有明显错误（如识别出的无意义字词），用 `[听不清]` 标记替换，不要保留乱码
+
+### Step 5: Claude 生成「会议纪要」Markdown
+
+基于 Step 4 的完整讲话记录，生成结构化的会议纪要。
+
+写入 `output/【会议纪要】<会议名>.md`：
+
+```markdown
+# 会议纪要：<会议名称>
+
+## 基本信息
+- **日期**：YYYY-MM-DD
+- **时长**：HH:MM:SS
+- **参会人**：（从对话中推断，列出可识别的角色和姓名）
+- **记录方式**：AI 自动转录 + 摘要生成
+
+## 会议主题
+
+用 1-2 句话概括本次会议的核心议题和目的。
+
+## 讨论要点
+
+### 1. <话题一>
+- 主要观点和讨论内容
+- 各方立场（如果存在分歧）
+
+### 2. <话题二>
+- ...
+
+> 按讨论的时间顺序或逻辑分组，每个话题 3-5 个要点
+
+## 决议与结论
+
+1. 明确达成的共识或决定
+2. ...
+
+## 待办事项
+
+- [ ] <具体任务> @<负责人>（如果对话中提到）⏱ <截止时间>（如果提到）
+- [ ] ...
+
+## 下次会议
+
+（如果对话中提到下次会议时间或议题，在此记录；否则省略此节）
+
+---
+*由 Claude 基于 whisper.cpp 转录文本自动生成，如有遗漏或错误请修正*
+```
+
+**纪要质量要求**：
+- **准确**：只基于实际对话内容，不添加虚构信息
+- **完整**：覆盖所有讨论过的话题，不遗漏
+- **简洁**：每个要点精炼到 1-3 句话
+- **可执行**：待办事项具体明确，包含负责人（如果对话中提到）
+- 如果对话中无法确定某个信息（如日期、参会人姓名），标注 `[待确认]` 而非编造
+
+### Step 6: 输出总结
+
+向用户展示处理结果摘要：
+
+```
+✅ 处理完成！
+
+📁 输出文件：
+  - output/【完整讲话记录】<会议名>.md  （完整对话，N 个说话人）
+  - output/【会议纪要】<会议名>.md       （结构化纪要）
+
+📊 统计：
+  - 音频时长：HH:MM:SS
+  - 转录字数：X 字
+  - 识别说话人：N 位
+  - 处理用时：M 分钟
+```
+
+---
+
+## 错误处理
+
+| 情况 | 处理方式 |
+|------|----------|
+| FFmpeg 未安装 | 引导安装 `winget install Gyan.FFmpeg` (Windows) / `brew install ffmpeg` (Mac)，暂停流程 |
+| whisper.cpp 未部署 | 引导部署（见前置依赖检查），暂停流程 |
+| whisper.cpp 模型未下载 | 引导下载模型，暂停流程 |
+| GPU 未被检测到 | 检查 CUDA 驱动和 Runtime 是否正常，验证 `nvidia-smi` |
+| 音频文件不存在/损坏 | 告知用户并跳过该文件 |
+| 转录结果为空 | 检查音频是否只有静音/噪音，建议用户确认音频质量 |
+| 单文件 > 2 小时 | 警告用户处理时间，建议先手动分段 |
+| whisper.cpp 中途崩溃 | 重试一次，如仍失败告知用户（可能是模型或显存问题） |
+| CUDA OOM（显存不足） | 降级到 CPU 模式（添加 `-ng` 参数禁用 GPU） |
+
+---
+
+## 注意事项
+
+1. **GPU 加速**：RTX 5090D (32GB VRAM, Blackwell, FP4 原生)，30 分钟音频约 30-60 秒完成。GPU 默认自动启用。
+2. **中文优化**：whisper.cpp 使用 `-l zh` 强制中文识别，避免中英混合时自动检测跳转。
+3. **说话人区分是推断**：Claude 基于文本上下文推断，不是声纹识别，准确性取决于对话的清晰度。在实际使用中告知用户这一限制。
+4. **隐私**：所有音频处理都在用户本地完成（whisper.cpp 本地运行），不经过任何云端服务。
+5. **输出文件**：两个 Markdown 文件都保存在 `output/` 目录，如果文件已存在则自动追加序号（如 `【会议纪要】XXX_2.md`）。
+
+## 快捷指令
+
+用户只需要：
+1. 把音频文件放入项目目录（或发送文件路径）
+2. 说 "处理这个音频" 或类似指令
+3. 等待完成
+
+无需手动指定格式、采样率等参数 — 所有预处理都由 Skill 自动完成。
