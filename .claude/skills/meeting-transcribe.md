@@ -151,20 +151,30 @@ ffprobe -v quiet -show_entries format=duration,format_name,size -of json <音频
 DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "<输入文件>")
 AUDIO_SECONDS=${DURATION%.*}
 
-# 如果时长 > 1800 秒（30分钟），分段处理
-# 否则直接转换
-if [ "$AUDIO_SECONDS" -gt 1800 ]; then
-  # 分段：每 30 分钟一段，自动编号
+# 检测是否末尾有长段静音（silence_start 到音频结尾）
+SILENCE_INFO=$(ffprobe -v quiet -i "<输入文件>" -af silencedetect=noise=-30dB:d=3.0 -f null - 2>&1 | grep "silence_end" | tail -1)
+
+# 如果时长 > 1200 秒（20分钟），分段处理
+# 否则直接转换（但先去除静音）
+if [ "$AUDIO_SECONDS" -gt 1200 ]; then
+  # 分段：每 15 分钟一段，自动编号
   ffmpeg -y -i "<输入文件>" -ar 16000 -ac 1 \
-    -f segment -segment_time 1800 \
+    -f segment -segment_time 900 \
     -c:a pcm_s16le "<输出前缀>_%03d.wav"
-  echo ">>> 音频已分为多段（每段 ≤ 30 分钟）"
+  echo ">>> 音频已分为多段（每段 ≤ 15 分钟）"
 else
-  # 直接转换：16kHz 单声道 WAV
-  ffmpeg -y -i "<输入文件>" -ar 16000 -ac 1 -c:a pcm_s16le "<输出文件>.wav"
-  echo ">>> 音频已转换为 16kHz 单声道 WAV"
+  # 去除首尾静音后转换：16kHz 单声道 WAV
+  # -af silenceremove 去除首尾静音（噪声阈值 -30dB，静音超过 3 秒即判定为无效）
+  ffmpeg -y -i "<输入文件>" \
+    -af "silenceremove=start_periods=1:start_duration=3:start_threshold=-30dB:stop_periods=1:stop_duration=3:stop_threshold=-30dB" \
+    -ar 16000 -ac 1 -c:a pcm_s16le "<输出文件>.wav"
+  echo ">>> 音频已去除首尾静音并转换为 16kHz 单声道 WAV"
 fi
 ```
+
+> **为什么去静音？** whisper.cpp 在音频末尾的静音区域容易产生"幻觉"——将同一段话反复识别为转录结果（称为**转录伪影**）。去除首尾静音可大幅减少此问题。
+>
+> **为什么20分钟就分段？** 分段后每段独立转录，即使某段产生伪影也只影响该段，便于定位和处理。同时避免单段过长时模型"遗忘"前面语境。
 
 **输出路径规范**：所有预处理后的 WAV 文件放在项目 `audio/` 目录下。
 
