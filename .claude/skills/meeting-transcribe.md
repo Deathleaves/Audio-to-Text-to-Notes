@@ -18,16 +18,31 @@ description: 将会议录音自动转为带说话人区分的文本，并生成�
 
 ## 环境初始化（每次执行前自动运行）
 
-在执行任何步骤前，先配置 PATH 环境变量：
+> **⚠️ 已知问题：Skill 自动调用失效**
+> 当前系统无法自动识别 `.claude/skills/meeting-transcribe.md`，调用 `Skill: meeting-transcribe` 会返回 "Unknown skill"。
+> **变通方案**：直接读取 `.claude/skills/meeting-transcribe.md` 并按其中的流程手动执行。
+
+### Windows 路径约定（⚠️ 必须遵守）
+
+在 Windows 上执行 whisper.cpp 时，**必须使用 `.exe` 后缀**：
 
 ```bash
-# 自动查找 winget 安装的工具路径
-FFMPEG_DIR=$(find "/c/Users/admin/AppData/Local/Microsoft/WinGet/Packages" -maxdepth 2 -name "ffmpeg.exe" -path "*/bin/*" 2>/dev/null | head -1 | xargs dirname)
-CUDA_BIN_DIR=$(find "/c/Program Files/NVIDIA GPU Computing Toolkit" -maxdepth 4 -name "cudart64_*.dll" -path "*/bin/*" 2>/dev/null | head -1 | xargs dirname)
-export PATH="$FFMPEG_DIR:$CUDA_BIN_DIR:$PATH"
+# ✅ 正确
+~/whisper.cpp/build/bin/whisper-cli.exe -m ...
+
+# ❌ 错误 — 会报 "command not found"
+~/whisper.cpp/build/bin/whisper-cli -m ...
 ```
 
-> **说明**：FFmpeg 通过 winget 安装。CUDA runtime DLL 路径确保 whisper.cpp 能找到 GPU 加速库。
+> **原因**：Windows Git Bash 不会自动补全 `.exe`，与 Linux/Mac 不同。
+
+### PATH 环境变量
+
+**不需要手动设置 PATH**。FFmpeg 已通过 winget 安装到系统 PATH 中，whisper.cpp 使用绝对路径调用，CUDA runtime 由 whisper.cpp 自动加载。
+
+> **历史教训**：之前尝试用 `find` 命令自动查找 FFmpeg 和 CUDA 路径并设置 PATH，
+> 但 `find` 在 Windows 上经常返回空结果导致 `dirname: missing operand` 错误。
+> 如果 FFmpeg 或 whisper-cli 不在 PATH 中，直接使用 `which ffmpeg` 或绝对路径即可。
 
 **GPU 可用性验证**（每次转录前确认）：
 ```bash
@@ -41,7 +56,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null
 ### 检查 FFmpeg
 
 ```bash
-ffmpeg -version 2>/dev/null && echo "OK" || echo "NOT FOUND"
+ffmpeg -version 2>/dev/null && echo "FFmpeg OK" || echo "FFmpeg NOT FOUND"
 ```
 
 如果未安装，告知用户：
@@ -50,13 +65,15 @@ ffmpeg -version 2>/dev/null && echo "OK" || echo "NOT FOUND"
 
 ### 检查 whisper.cpp（需 CUDA/GPU 版本）
 
+> **⚠️ Windows 上必须用 `.exe` 后缀**
+
 ```bash
-~/whisper.cpp/build/bin/whisper-cli --version 2>/dev/null | head -1
+~/whisper.cpp/build/bin/whisper-cli.exe --version 2>/dev/null | head -1
 ```
 
 验证 GPU 支持（在转录输出中应显示 `CUDA0` 设备和 VRAM 信息）：
 ```bash
-~/whisper.cpp/build/bin/whisper-cli -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin -l zh -f /dev/null 2>&1 | grep -i cuda || echo "⚠ GPU 可能未启用"
+~/whisper.cpp/build/bin/whisper-cli.exe -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin -l zh -f /dev/null 2>&1 | grep -i cuda || echo "⚠ GPU 可能未启用"
 ```
 
 如果未找到，告知用户：
@@ -81,7 +98,7 @@ ffmpeg -version 2>/dev/null && echo "OK" || echo "NOT FOUND"
 ### 检查 whisper.cpp 模型文件
 
 ```bash
-test -f ~/whisper.cpp/models/ggml-large-v3-q5_0.bin && echo "OK" || echo "NOT FOUND"
+test -f ~/whisper.cpp/models/ggml-large-v3-q5_0.bin && echo "Model OK" || echo "Model NOT FOUND"
 ```
 
 如果未找到，告知用户：
@@ -155,8 +172,10 @@ fi
 
 对每个预处理后的 WAV 文件，执行转录（**GPU 自动启用**，无需额外参数）：
 
+> **⚠️ Windows 上必须用 `.exe` 后缀**
+
 ```bash
-~/whisper.cpp/build/bin/whisper-cli \
+~/whisper.cpp/build/bin/whisper-cli.exe \
   -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin \
   -l zh \
   -osrt \
@@ -180,7 +199,35 @@ fi
 
 **多段处理**：如果 Step 2 产生了多个分段，按顺序对每个分段执行转录，然后将文本内容按时间顺序合并（注意分段可能有时间偏移，需要累加时间）。
 
-### Step 4: Claude 分析转录文本 + 说话人区分
+### Step 3.5: 检查转录质量（⚠️ 重要）
+
+在继续 Step 4 之前，先检查 SRT 输出是否存在以下问题：
+
+#### 3.5.1 重复文本检测
+
+如果 SRT 中出现**同一段话被反复识别**（如"你要求名证的时候一定要注意"出现数百次），
+说明音频末尾有静音或回音导致 whisper.cpp 产生**转录伪影**。
+
+**处理方式**：
+- 在完整讲话记录中标注 `[转录伪影]`，说明该段内容为无效重复
+- 不要将伪影内容计入有效转录文字数
+- 在文档开头用 `> ⚠️ 说明` 告知用户存在转录伪影及原因
+
+#### 3.5.2 专业术语偏差
+
+whisper.cpp 对人名、课程名、专业术语的识别可能不准确（如"全球的人口"可能是某个人名或机构名）。
+
+**处理方式**：
+- 无法确认的词用 `[听不清]` 标注
+- 明显是专有名词但识别错误的，用 `[听不清：可能是XXX]` 标注猜测
+
+#### 3.5.3 转录结果为空
+
+如果转录结果几乎为空或只有少量无意义文字，检查音频是否只有静音/噪音。
+
+---
+
+## Step 4: Claude 分析转录文本 + 说话人区分
 
 读取 whisper.cpp 输出的 SRT 文件（和 TXT 文件作为辅助），执行以下分析：
 
@@ -294,7 +341,24 @@ fi
 - **可执行**：待办事项具体明确，包含负责人（如果对话中提到）
 - 如果对话中无法确定某个信息（如日期、参会人姓名），标注 `[待确认]` 而非编造
 
-### Step 6: 输出总结
+### Step 6: 清理中间文件
+
+转录完成后，清理预处理产生的临时文件，只保留最终输出：
+
+```bash
+# 删除预处理后的 WAV 文件
+rm -f "<audio/目录下的_preprocessed.wav 文件>"
+
+# 删除转录中间文件
+rm -f "<output/目录下的 _transcript.srt 文件>"
+rm -f "<output/目录下的 _transcript.txt 文件>"
+```
+
+只保留 `output/` 目录下的两个 Markdown 文件：
+- `【完整讲话记录】<会议名>.md`
+- `【会议纪要】<会议名>.md`
+
+### Step 7: 输出总结
 
 向用户展示处理结果摘要：
 
@@ -337,6 +401,8 @@ fi
 3. **说话人区分是推断**：Claude 基于文本上下文推断，不是声纹识别，准确性取决于对话的清晰度。在实际使用中告知用户这一限制。
 4. **隐私**：所有音频处理都在用户本地完成（whisper.cpp 本地运行），不经过任何云端服务。
 5. **输出文件**：两个 Markdown 文件都保存在 `output/` 目录，如果文件已存在则自动追加序号（如 `【会议纪要】XXX_2.md`）。
+6. **日期前置**：输出文档中日期（YYYY-MM-DD 格式）必须醒目地写在文档前面，方便按时间查找和归档。
+7. **Windows `.exe` 后缀**：在 Windows 上执行 whisper-cli 时**必须**加 `.exe` 后缀，否则会报 "command not found"。
 
 ## 快捷指令
 
