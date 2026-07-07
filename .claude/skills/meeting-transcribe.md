@@ -154,14 +154,26 @@ AUDIO_SECONDS=${DURATION%.*}
 # 检测是否末尾有长段静音（silence_start 到音频结尾）
 SILENCE_INFO=$(ffprobe -v quiet -i "<输入文件>" -af silencedetect=noise=-30dB:d=3.0 -f null - 2>&1 | grep "silence_end" | tail -1)
 
-# 如果时长 > 1200 秒（20分钟），分段处理
-# 否则直接转换（但先去除静音）
+# ⚠️ 关键规则：无论音频长短，都必须先去除静音再分段！
+# 如果先分段，每段末尾残留静音会导致 whisper.cpp 产生转录伪影
+# （同一段话被反复识别数百次）。先去除静音再分段可避免此问题。
+
+# 如果时长 > 1200 秒（20分钟），先去除静音再分段
+# 否则直接去除静音转换
 if [ "$AUDIO_SECONDS" -gt 1200 ]; then
-  # 分段：每 15 分钟一段，自动编号
-  ffmpeg -y -i "<输入文件>" -ar 16000 -ac 1 \
+  # 第一步：去除首尾静音，转为 16kHz 单声道
+  ffmpeg -y -i "<输入文件>" \
+    -af "silenceremove=start_periods=1:start_duration=3:start_threshold=-30dB:stop_periods=1:stop_duration=3:stop_threshold=-30dB" \
+    -ar 16000 -ac 1 -c:a pcm_s16le "<输出前缀>_denoised.wav"
+
+  # 第二步：对去噪后的音频分段（每 15 分钟一段）
+  ffmpeg -y -i "<输出前缀>_denoised.wav" \
     -f segment -segment_time 900 \
     -c:a pcm_s16le "<输出前缀>_%03d.wav"
-  echo ">>> 音频已分为多段（每段 ≤ 15 分钟）"
+
+  # 清理中间文件
+  rm -f "<输出前缀>_denoised.wav"
+  echo ">>> 音频已去除静音并分为多段（每段 ≤ 15 分钟）"
 else
   # 去除首尾静音后转换：16kHz 单声道 WAV
   # -af silenceremove 去除首尾静音（噪声阈值 -30dB，静音超过 3 秒即判定为无效）
@@ -172,9 +184,9 @@ else
 fi
 ```
 
-> **为什么去静音？** whisper.cpp 在音频末尾的静音区域容易产生"幻觉"——将同一段话反复识别为转录结果（称为**转录伪影**）。去除首尾静音可大幅减少此问题。
+> **为什么先去除静音再分段？** whisper.cpp 在音频末尾的静音区域容易产生"幻觉"——将同一段话反复识别为转录结果（称为**转录伪影**）。如果先分段，每段末尾可能残留静音导致伪影。先去除静音再分段，每段就不会有静音尾巴，彻底避免此问题。
 >
-> **为什么20分钟就分段？** 分段后每段独立转录，即使某段产生伪影也只影响该段，便于定位和处理。同时避免单段过长时模型"遗忘"前面语境。
+> **为什么20分钟就分段？** 分段后每段独立转录，便于并行处理加快速度。同时避免单段过长时模型"遗忘"前面语境。
 
 **输出路径规范**：所有预处理后的 WAV 文件放在项目 `audio/` 目录下。
 
