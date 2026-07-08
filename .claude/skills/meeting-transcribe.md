@@ -9,7 +9,7 @@ description: 将会议录音自动转为带说话人区分的文本，并生成�
 
 当用户发送音频文件时，自动执行以下流程：
 1. FFmpeg 音频预处理（自动检测格式、时长，按需分段）
-2. whisper.cpp **GPU 加速**语音转文字（本地部署，RTX 5090D，中文 large-v3 模型）
+2. whisper.cpp **GPU 加速**语音转文字（本地部署，RTX 5090D，中文 large-v3-turbo Q8 模型）
 3. Claude 分析文本，区分说话人
 4. 输出「完整讲话记录」Markdown 文件
 5. Claude 生成「会议纪要」Markdown 文件
@@ -73,7 +73,7 @@ ffmpeg -version 2>/dev/null && echo "FFmpeg OK" || echo "FFmpeg NOT FOUND"
 
 验证 GPU 支持（在转录输出中应显示 `CUDA0` 设备和 VRAM 信息）：
 ```bash
-~/whisper.cpp/build/bin/whisper-cli.exe -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin -l zh -f /dev/null 2>&1 | grep -i cuda || echo "⚠ GPU 可能未启用"
+~/whisper.cpp/build/bin/whisper-cli.exe -m ~/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin -l zh -f /dev/null 2>&1 | grep -i cuda || echo "⚠ GPU 可能未启用"
 ```
 
 如果未找到，告知用户：
@@ -92,25 +92,26 @@ ffmpeg -version 2>/dev/null && echo "FFmpeg OK" || echo "FFmpeg NOT FOUND"
 > ```
 > 5. 下载模型：
 > ```bash
-> bash ./models/download-ggml-model.sh large-v3-q5_0
+> bash ./models/download-ggml-model.sh large-v3-turbo
+> # 然后量化为 Q8_0：
+> ~/whisper.cpp/build/bin/whisper-quantize.exe ~/whisper.cpp/models/ggml-large-v3-turbo.bin ~/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin q8_0
 > ```
 
 ### 检查 whisper.cpp 模型文件
 
 ```bash
-test -f ~/whisper.cpp/models/ggml-large-v3-q5_0.bin && echo "Model OK" || echo "Model NOT FOUND"
+test -f ~/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin && echo "Model OK" || echo "Model NOT FOUND"
 ```
 
 如果未找到，告知用户：
 
 > whisper.cpp 模型文件未下载，请运行：
 > ```bash
-> cd ~/whisper.cpp && bash ./models/download-ggml-model.sh large-v3-q5_0
+> cd ~/whisper.cpp && bash ./models/download-ggml-model.sh large-v3-turbo
 > ```
-> 如果 HuggingFace 无法访问，可用镜像：
+> 下载后量化为 Q8_0：
 > ```bash
-> curl -L -o ~/whisper.cpp/models/ggml-large-v3-q5_0.bin \
->   "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin"
+> ~/whisper.cpp/build/bin/whisper-quantize.exe ~/whisper.cpp/models/ggml-large-v3-turbo.bin ~/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin q8_0
 > ```
 
 如果所有依赖就绪，直接进入流程。
@@ -151,42 +152,62 @@ ffprobe -v quiet -show_entries format=duration,format_name,size -of json <音频
 DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "<输入文件>")
 AUDIO_SECONDS=${DURATION%.*}
 
-# 检测是否末尾有长段静音（silence_start 到音频结尾）
-SILENCE_INFO=$(ffprobe -v quiet -i "<输入文件>" -af silencedetect=noise=-30dB:d=3.0 -f null - 2>&1 | grep "silence_end" | tail -1)
+# ⚠️ 关键规则：无论音频长短，都必须先归一化音量，再去除静音，再分段！
+# 1. 音量归一化：低音量音频（如 Mac 录音 RMS -33dB）会导致 whisper.cpp 产生幻觉
+# 2. 去除静音：避免转录伪影（同一段话被反复识别数百次）
+# 3. 分段：每段 ≤ 15 分钟，避免模型"遗忘"前面语境
 
-# ⚠️ 关键规则：无论音频长短，都必须先去除静音再分段！
-# 如果先分段，每段末尾残留静音会导致 whisper.cpp 产生转录伪影
-# （同一段话被反复识别数百次）。先去除静音再分段可避免此问题。
+# 第一步：音量归一化（loudnorm），转为 16kHz 单声道
+# 先测量音频响度
+MEASURE=$(ffmpeg -y -i "<输入文件>" -af "loudnorm=I=-23:TP=-1.5:LRA=20:print_format=json" -f null - 2>&1 | grep -A99 '"input_i"' | head -10)
+INPUT_I=$(echo "$MEASURE" | grep '"input_i"' | sed 's/.*: *"\([^"]*\)".*/\1/')
+INPUT_TP=$(echo "$MEASURE" | grep '"input_tp"' | sed 's/.*: *"\([^"]*\)".*/\1/')
+INPUT_LRA=$(echo "$MEASURE" | grep '"input_lra"' | sed 's/.*: *"\([^"]*\)".*/\1/')
+INPUT_THRESH=$(echo "$MEASURE" | grep '"input_thresh"' | sed 's/.*: *"\([^"]*\)".*/\1/')
+OFFSET=$(echo "$MEASURE" | grep '"target_offset"' | sed 's/.*: *"\([^"]*\)".*/\1/')
 
-# 如果时长 > 1200 秒（20分钟），先去除静音再分段
-# 否则直接去除静音转换
-if [ "$AUDIO_SECONDS" -gt 1200 ]; then
-  # 第一步：去除首尾静音，转为 16kHz 单声道
-  ffmpeg -y -i "<输入文件>" \
-    -af "silenceremove=start_periods=1:start_duration=3:start_threshold=-30dB:stop_periods=1:stop_duration=3:stop_threshold=-30dB" \
-    -ar 16000 -ac 1 -c:a pcm_s16le "<输出前缀>_denoised.wav"
+# 双通道归一化（更精确）
+ffmpeg -y -i "<输入文件>" \
+  -af "loudnorm=I=-23:TP=-1.5:LRA=20:measured_I=${INPUT_I}:measured_TP=${INPUT_TP}:measured_LRA=${INPUT_LRA}:measured_thresh=${INPUT_THRESH}:offset=${OFFSET}:linear=true" \
+  -ar 16000 -ac 1 -c:a pcm_s16le "<输出前缀>_normalized.wav"
 
-  # 第二步：对去噪后的音频分段（每 15 分钟一段）
+# 检查归一化后音量
+NORM_RMS=$(ffmpeg -y -i "<输出前缀>_normalized.wav" -af "astats" -f null - 2>&1 | grep "RMS level" | head -1 | sed 's/.*: *\(-[0-9.]*\).*/\1/')
+echo ">>> 音量归一化完成，RMS: ${NORM_RMS}dB（目标约 -23dB）"
+
+# 第二步：去除首尾静音（归一化后阈值 -40dB 更合理）
+ffmpeg -y -i "<输出前缀>_normalized.wav" \
+  -af "silenceremove=start_periods=1:start_duration=3:start_threshold=-40dB:stop_periods=1:stop_duration=3:stop_threshold=-40dB" \
+  -ar 16000 -ac 1 -c:a pcm_s16le "<输出前缀>_denoised.wav"
+
+# 清理中间文件
+rm -f "<输出前缀>_normalized.wav"
+
+# 第三步：根据时长决定是否分段
+DENOISED_DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "<输出前缀>_denoised.wav")
+DENOISED_SECONDS=${DENOISED_DURATION%.*}
+
+if [ "$DENOISED_SECONDS" -gt 900 ]; then
+  # 分段（每 15 分钟一段）
   ffmpeg -y -i "<输出前缀>_denoised.wav" \
     -f segment -segment_time 900 \
     -c:a pcm_s16le "<输出前缀>_%03d.wav"
 
   # 清理中间文件
   rm -f "<输出前缀>_denoised.wav"
-  echo ">>> 音频已去除静音并分为多段（每段 ≤ 15 分钟）"
+  echo ">>> 音频已归一化音量、去除静音并分为多段（每段 ≤ 15 分钟）"
 else
-  # 去除首尾静音后转换：16kHz 单声道 WAV
-  # -af silenceremove 去除首尾静音（噪声阈值 -30dB，静音超过 3 秒即判定为无效）
-  ffmpeg -y -i "<输入文件>" \
-    -af "silenceremove=start_periods=1:start_duration=3:start_threshold=-30dB:stop_periods=1:stop_duration=3:stop_threshold=-30dB" \
-    -ar 16000 -ac 1 -c:a pcm_s16le "<输出文件>.wav"
-  echo ">>> 音频已去除首尾静音并转换为 16kHz 单声道 WAV"
+  # 直接使用
+  mv "<输出前缀>_denoised.wav" "<输出文件>.wav"
+  echo ">>> 音频已归一化音量、去除首尾静音并转换为 16kHz 单声道 WAV"
 fi
 ```
 
-> **为什么先去除静音再分段？** whisper.cpp 在音频末尾的静音区域容易产生"幻觉"——将同一段话反复识别为转录结果（称为**转录伪影**）。如果先分段，每段末尾可能残留静音导致伪影。先去除静音再分段，每段就不会有静音尾巴，彻底避免此问题。
+> **为什么先归一化音量？** 低音量音频（如 Mac 录音 RMS -33dB）会让 whisper.cpp 在低音量区域产生"幻觉"——将同一段话反复识别为转录结果。先归一化到标准响度（-23 LUFS），模型就能正确识别。
 >
-> **为什么20分钟就分段？** 分段后每段独立转录，便于并行处理加快速度。同时避免单段过长时模型"遗忘"前面语境。
+> **为什么双通道 loudnorm？** 第一通道测量音频实际响度，第二通道用测量值精确归一化，比单通道更准确。
+>
+> **为什么归一化后静音阈值改为 -40dB？** 归一化后音量提升到标准水平，-40dB 阈值能更准确地检测真正的静音段。
 
 **输出路径规范**：所有预处理后的 WAV 文件放在项目 `audio/` 目录下。
 
@@ -198,7 +219,7 @@ fi
 
 ```bash
 ~/whisper.cpp/build/bin/whisper-cli.exe \
-  -m ~/whisper.cpp/models/ggml-large-v3-q5_0.bin \
+  -m ~/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin \
   -l zh \
   -osrt \
   -otxt \
@@ -207,7 +228,7 @@ fi
 ```
 
 > **GPU 加速**：RTX 5090D (32GB VRAM)，whisper-cli 编译时已启用 CUDA，运行时自动检测 GPU。
-> 模型完全加载到 GPU 显存（~1.1GB），encode 时间比 CPU 快 **~157x**。
+> 模型完全加载到 GPU 显存（~0.8GB），encode 时间比 CPU 快 **~157x**。
 
 参数说明：
 - `-m`: 模型文件路径
@@ -275,7 +296,7 @@ whisper.cpp 对人名、课程名、专业术语的识别可能不准确（如"�
 
 #### 4.4 输出「完整讲话记录」Markdown
 
-写入 `output/【完整讲话记录】<会议名>.md`：
+写入 `output/<日期>【完整讲话记录】<会议名>.md`：
 
 ```markdown
 # 完整讲话记录：<会议名称>
@@ -283,7 +304,7 @@ whisper.cpp 对人名、课程名、专业术语的识别可能不准确（如"�
 **日期**：YYYY-MM-DD
 **时长**：HH:MM:SS
 **音频文件**：xxx.mp3, xxx.mp3
-**转录引擎**：whisper.cpp large-v3-q5_0
+**转录引擎**：whisper.cpp large-v3-turbo-q8_0
 **说话人区分**：Claude 自动分析
 
 ---
@@ -312,7 +333,7 @@ whisper.cpp 对人名、课程名、专业术语的识别可能不准确（如"�
 
 基于 Step 4 的完整讲话记录，生成结构化的会议纪要。
 
-写入 `output/【会议纪要】<会议名>.md`：
+写入 `output/<日期>【会议纪要】<会议名>.md`：
 
 ```markdown
 # 会议纪要：<会议名称>
@@ -377,8 +398,8 @@ rm -f "<output/目录下的 _transcript.txt 文件>"
 ```
 
 只保留 `output/` 目录下的两个 Markdown 文件：
-- `【完整讲话记录】<会议名>.md`
-- `【会议纪要】<会议名>.md`
+- `<日期>【完整讲话记录】<会议名>.md`
+- `<日期>【会议纪要】<会议名>.md`
 
 ### Step 7: 输出总结
 

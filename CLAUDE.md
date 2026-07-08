@@ -21,7 +21,7 @@
 ## 前置依赖（需用户提前配置）
 
 - **FFmpeg**: `winget install Gyan.FFmpeg` (Windows) / `brew install ffmpeg` (Mac)
-- **whisper.cpp**: 克隆到 `~/whisper.cpp`，**CUDA 版编译**并下载 `large-v3-q5_0` 模型
+- **whisper.cpp**: 克隆到 `~/whisper.cpp`，**CUDA 版编译**并下载 `large-v3-turbo` 模型后量化为 `q8_0`
 - **NVIDIA GPU + CUDA Toolkit**: RTX 5090D (32GB VRAM)，CUDA 13.2
 
 详见 `.claude/skills/meeting-transcribe.md` 中的前置依赖检查部分。
