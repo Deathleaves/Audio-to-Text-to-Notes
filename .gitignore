@@ -20,6 +20,9 @@ output/
 # Claude Code 本地设置（可能包含 PAT token / API keys）
 .claude/settings.local.json
 
+# Token 统计工具本地数据
+.tokensave/
+
 # 项目原始需求文档
 目标.md
 
